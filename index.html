@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Online Barcode Description Lookup</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+<div class="container">
+
+    <header>
+        <h1>Online Barcode &rarr; Item Description Lookup</h1>
+        <p>Upload a CSV or Excel file and find item descriptions online.</p>
+    </header>
+
+    <section class="card">
+
+        <h2>1. Select File</h2>
+
+        <input type="file" id="csvFile"
+               accept=".csv,.xlsx,.xlsm,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+
+        <p class="hint">Supported formats: .csv, .xlsx, .xlsm, .xls</p>
+
+        <div id="sheetWrapper" class="field" hidden>
+            <label for="sheetSelect">Worksheet</label>
+            <select id="sheetSelect"></select>
+        </div>
+
+        <div id="fileInfo" class="info"></div>
+
+    </section>
+
+    <section class="card">
+
+        <h2>2. Barcode Column</h2>
+
+        <select id="barcodeColumn">
+            <option value="">Automatically detect barcode column</option>
+        </select>
+
+    </section>
+
+    <section class="card">
+
+        <h2>3. Online Lookup</h2>
+
+        <button id="startButton" disabled>
+            START ONLINE LOOKUP
+        </button>
+
+        <div class="progress-container">
+
+            <div class="progress-bar">
+                <div id="progressBar"></div>
+            </div>
+
+            <div id="progressText">
+                Ready
+            </div>
+
+        </div>
+
+    </section>
+
+    <section class="card">
+
+        <h2>Results</h2>
+
+        <div class="stats">
+
+            <div>
+                <span>Rows</span>
+                <strong id="rows">0</strong>
+            </div>
+
+            <div>
+                <span>Unique Barcodes</span>
+                <strong id="unique">0</strong>
+            </div>
+
+            <div>
+                <span>Found</span>
+                <strong id="found">0</strong>
+            </div>
+
+            <div>
+                <span>Not Found</span>
+                <strong id="notFound">0</strong>
+            </div>
+
+        </div>
+
+        <div class="download-row">
+
+            <div class="field">
+                <label for="outputFormat">Download format</label>
+                <select id="outputFormat">
+                    <option value="xlsx">Excel (.xlsx)</option>
+                    <option value="csv">CSV (.csv)</option>
+                </select>
+            </div>
+
+            <button id="downloadButton" disabled>
+                DOWNLOAD RESULT FILE
+            </button>
+
+        </div>
+
+    </section>
+
+    <section class="card">
+
+        <h2>Preview</h2>
+
+        <div class="table-container">
+
+            <table>
+
+                <thead>
+                    <tr>
+                        <th>Barcode</th>
+                        <th>Item Description</th>
+                        <th>Source</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+
+                <tbody id="resultsTable"></tbody>
+
+            </table>
+
+        </div>
+
+    </section>
+
+</div>
+
+<!-- SheetJS: local copy first, online CDN as fallback -->
+<script src="lib/xlsx.full.min.js"></script>
+<script>
+    if (typeof XLSX === "undefined") {
+        document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"><\/script>');
+    }
+</script>
+
+<script src="app.js"></script>
+
+</body>
+</html>

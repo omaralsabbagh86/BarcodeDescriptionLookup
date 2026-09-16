@@ -1,0 +1,4 @@
+backup_*/
+*.ps1
+Thumbs.db
+desktop.ini
