@@ -6,6 +6,7 @@ const barcodeColumn = document.getElementById("barcodeColumn");
 const startButton = document.getElementById("startButton");
 const downloadButton = document.getElementById("downloadButton");
 const outputFormat = document.getElementById("outputFormat");
+const wantedButton = document.getElementById("wantedButton");
 
 const rowsElement = document.getElementById("rows");
 const uniqueElement = document.getElementById("unique");
@@ -235,6 +236,49 @@ function toEan13(barcode) {
 }
 
 
+function hasValidCheckDigit(ean13) {
+
+    let sum = 0;
+
+    for (let i = 0; i < 12; i++) {
+        sum += Number(ean13[i]) * (i % 2 ? 3 : 1);
+    }
+
+    return (10 - (sum % 10)) % 10 === Number(ean13[12]);
+}
+
+
+// Tells whether a barcode can exist in online product sources
+function classifyBarcode(barcode) {
+
+    const digits = normalizeBarcode(barcode);
+
+    if (!digits) {
+        return "EMPTY";
+    }
+
+    if (digits.length < 8) {
+        return "SHORT / INTERNAL CODE";
+    }
+
+    const ean = toEan13(digits);
+
+    if (!ean) {
+        return "INVALID LENGTH";
+    }
+
+    if (!hasValidCheckDigit(ean)) {
+        return "INVALID CHECK DIGIT";
+    }
+
+    if (/^(2|02|04|05|98|99)/.test(ean)) {
+        return "IN-STORE / RESTRICTED CODE";
+    }
+
+    return "VALID";
+}
+
+
 function databasePrefix(ean13) {
 
     return ean13.startsWith("978") || ean13.startsWith("979")
@@ -295,6 +339,7 @@ function resetResults() {
     resultsTable.innerHTML = "";
     results = [];
     downloadButton.disabled = true;
+    wantedButton.disabled = true;
     progressBar.style.width = "0%";
     progressText.textContent = "Ready to start";
     foundElement.textContent = "0";
@@ -793,6 +838,7 @@ startButton.addEventListener("click", async function () {
     setControlsDisabled(true);
 
     downloadButton.disabled = true;
+    wantedButton.disabled = true;
     resultsTable.innerHTML = "";
     progressBar.style.width = "0%";
     progressText.textContent = "Starting lookup...";
@@ -864,13 +910,15 @@ startButton.addEventListener("click", async function () {
         }
 
         const foundCount = results.filter(r => r.status === "FOUND").length;
+        const searchable = getWantedBarcodes().length;
 
         progressBar.style.width = "100%";
 
         progressText.textContent =
-            `Completed: ${results.length.toLocaleString()} unique barcodes checked, ${foundCount.toLocaleString()} found`;
+            `Completed: ${results.length.toLocaleString()} unique barcodes checked, ${foundCount.toLocaleString()} found, ${searchable.toLocaleString()} missing with a valid barcode`;
 
         downloadButton.disabled = false;
+        wantedButton.disabled = searchable === 0;
 
     } catch (error) {
 
@@ -912,7 +960,8 @@ function buildResultRows() {
         ...headers,
         "Online Item Description",
         "Lookup Source",
-        "Lookup Status"
+        "Lookup Status",
+        "Barcode Check"
     ]];
 
     sourceRows.forEach(row => {
@@ -923,7 +972,8 @@ function buildResultRows() {
             ...row,
             result ? result.description : "",
             result ? result.source : "",
-            result ? result.status : ""
+            result ? result.status : "",
+            classifyBarcode(row[selectedColumn])
         ]);
     });
 
@@ -1002,11 +1052,11 @@ function createResultXLSX(fileName) {
         "Results"
     );
 
-    const notFoundRows = [["Barcode", "Lookup Status"]];
+    const notFoundRows = [["Barcode", "EAN-13", "Lookup Status", "Barcode Check"]];
 
     results.forEach(r => {
         if (r.status !== "FOUND") {
-            notFoundRows.push([r.barcode, r.status]);
+            notFoundRows.push([r.barcode, toEan13(r.barcode), r.status, classifyBarcode(r.barcode)]);
         }
     });
 
@@ -1082,4 +1132,39 @@ downloadButton.addEventListener("click", function () {
 
         progressText.textContent = "Download failed: " + error.message;
     }
+});
+
+
+/* ---------------- Missing list for the retail database ---------------- */
+
+function getWantedBarcodes() {
+
+    const list = new Set();
+
+    results.forEach(r => {
+        if (r.status !== "FOUND" && classifyBarcode(r.barcode) === "VALID") {
+            list.add(toEan13(r.barcode));
+        }
+    });
+
+    return [...list];
+}
+
+
+wantedButton.addEventListener("click", function () {
+
+    const list = getWantedBarcodes();
+
+    if (!list.length) {
+        return;
+    }
+
+    downloadBlob(
+        list.join("\n") + "\n",
+        "wanted_barcodes.txt",
+        "text/plain;charset=utf-8;"
+    );
+
+    progressText.textContent =
+        `wanted_barcodes.txt downloaded (${list.length.toLocaleString()} barcodes) - run Setup-FreeSources.ps1 to send it to your database`;
 });

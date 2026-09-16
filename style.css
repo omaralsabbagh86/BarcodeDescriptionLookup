@@ -215,3 +215,8 @@ input:focus-visible {
     width: auto;
     padding: 0;
 }
+
+#wantedButton {
+    background: #6b4fbb;
+    color: white;
+}
