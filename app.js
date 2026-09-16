@@ -16,7 +16,19 @@ const progressBar = document.getElementById("progressBar");
 const progressText = document.getElementById("progressText");
 const resultsTable = document.getElementById("resultsTable");
 
+const lookupSource = document.getElementById("lookupSource");
+const apiFallback = document.getElementById("apiFallback");
+
 const EXCEL_EXTENSIONS = ["xlsx", "xlsm", "xls"];
+const EXCEL_MAX_ROWS = 1048576;
+
+// Your public retail database on GitHub (files split by barcode prefix)
+const DB_BASE_URL = "https://raw.githubusercontent.com/omaralsabbagh86/retail-ean13-db/main/data/";
+const DB_FETCH_WORKERS = 4;
+
+// Open Food Facts API is rate-limited: keep it for small batches only
+const API_MAX_BARCODES = 300;
+const API_DELAY_MS = 1200;
 
 let sourceRows = [];
 let headers = [];
@@ -145,20 +157,39 @@ function sheetToRows(sheet) {
     }
 
     const range = XLSX.utils.decode_range(sheet["!ref"]);
+
+    // Dense mode: SheetJS 0.20 uses sheet["!data"], 0.18 uses the sheet itself as an array
+    const dense = sheet["!data"] || (Array.isArray(sheet) ? sheet : null);
+
     const rows = [];
 
     for (let r = range.s.r; r <= range.e.r; r++) {
 
+        const denseRow = dense ? dense[r] : null;
+
+        if (dense && !denseRow) {
+            continue;
+        }
+
         const row = [];
+        let hasValue = false;
 
         for (let c = range.s.c; c <= range.e.c; c++) {
 
-            const address = XLSX.utils.encode_cell({ r, c });
+            const cell = dense
+                ? denseRow[c]
+                : sheet[XLSX.utils.encode_cell({ r, c })];
 
-            row.push(cellToText(sheet[address]));
+            const text = cellToText(cell);
+
+            if (!hasValue && text.trim() !== "") {
+                hasValue = true;
+            }
+
+            row.push(text);
         }
 
-        if (row.some(value => value.trim() !== "")) {
+        if (hasValue) {
             rows.push(row);
         }
     }
@@ -184,6 +215,31 @@ function normalizeBarcode(value) {
     barcode = barcode.replace(/\D/g, "");
 
     return barcode;
+}
+
+
+// Convert to the 13-digit form used by the retail database
+function toEan13(barcode) {
+
+    let digits = normalizeBarcode(barcode);
+
+    if (digits.length === 14 && digits.startsWith("0")) {
+        digits = digits.slice(1);
+    }
+
+    if (!digits || digits.length > 13) {
+        return "";
+    }
+
+    return digits.padStart(13, "0");
+}
+
+
+function databasePrefix(ean13) {
+
+    return ean13.startsWith("978") || ean13.startsWith("979")
+        ? ean13.slice(0, 5)
+        : ean13.slice(0, 3);
 }
 
 
@@ -257,24 +313,25 @@ function loadParsedRows(parsed, sheetName) {
         return name || `Column ${i + 1}`;
     });
 
-    const columnCount = Math.max(
-        headers.length,
-        ...parsed.map(r => r.length)
-    );
+    // Loop instead of Math.max(...array): spreading 800k rows overflows the call stack
+    let columnCount = headers.length;
+
+    for (let i = 0; i < parsed.length; i++) {
+        if (parsed[i].length > columnCount) {
+            columnCount = parsed[i].length;
+        }
+    }
 
     while (headers.length < columnCount) {
         headers.push(`Column ${headers.length + 1}`);
     }
 
-    sourceRows = parsed.slice(1).map(row => {
+    sourceRows = parsed.slice(1);
 
-        const copy = row.slice();
-
-        while (copy.length < columnCount) {
-            copy.push("");
+    sourceRows.forEach(row => {
+        while (row.length < columnCount) {
+            row.push("");
         }
-
-        return copy;
     });
 
     barcodeColumn.innerHTML = "";
@@ -345,7 +402,17 @@ csvFile.addEventListener("change", async function () {
 
             const buffer = await file.arrayBuffer();
 
-            currentWorkbook = XLSX.read(buffer, { type: "array" });
+            fileInfo.textContent = "Reading Excel file (large files can take a minute)...";
+
+            await new Promise(resolve => setTimeout(resolve, 50));
+
+            currentWorkbook = XLSX.read(buffer, {
+                type: "array",
+                dense: true,
+                cellFormula: false,
+                cellHTML: false,
+                cellStyles: false
+            });
 
             if (!currentWorkbook.SheetNames.length) {
                 throw new Error("Workbook contains no sheets.");
@@ -373,6 +440,11 @@ csvFile.addEventListener("change", async function () {
                 sheetToRows(currentWorkbook.Sheets[firstSheet]),
                 firstSheet
             );
+
+            // Single sheet: free the workbook memory
+            if (currentWorkbook.SheetNames.length < 2) {
+                currentWorkbook = null;
+            }
 
         } else {
 
@@ -495,60 +567,192 @@ async function lookupBarcode(barcode) {
 }
 
 
-async function processWithConcurrency(items, workerCount = 5) {
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+
+function makeResult(barcode, description, source, status) {
+    return { barcode, description, source, status };
+}
+
+
+async function fetchDatabaseFile(prefix) {
+
+    const url = `${DB_BASE_URL}ean_${prefix}.csv`;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+
+        try {
+
+            const response = await fetch(url);
+
+            if (response.status === 404) {
+                return "";
+            }
+
+            if (response.ok) {
+                return await response.text();
+            }
+
+        } catch (error) {
+            // retry below
+        }
+
+        await sleep(1000 * attempt);
+    }
+
+    throw new Error(`Could not download ean_${prefix}.csv`);
+}
+
+
+async function lookupInDatabase(barcodes) {
+
+    const resultMap = new Map();
+
+    // prefix -> Map(ean13 -> [original barcodes])
+    const groups = new Map();
+
+    barcodes.forEach(barcode => {
+
+        const ean = toEan13(barcode);
+
+        if (!ean) {
+            resultMap.set(barcode, makeResult(barcode, "", "Retail DB", "INVALID"));
+            return;
+        }
+
+        const prefix = databasePrefix(ean);
+
+        if (!groups.has(prefix)) {
+            groups.set(prefix, new Map());
+        }
+
+        const group = groups.get(prefix);
+
+        if (!group.has(ean)) {
+            group.set(ean, []);
+        }
+
+        group.get(ean).push(barcode);
+    });
+
+    const prefixes = [...groups.keys()].sort();
 
     let nextIndex = 0;
-    let completed = 0;
-
-    const output = new Array(items.length);
+    let filesDone = 0;
+    let found = 0;
 
     async function worker() {
 
-        while (true) {
+        while (nextIndex < prefixes.length) {
 
-            const index = nextIndex++;
+            const prefix = prefixes[nextIndex++];
+            const group = groups.get(prefix);
 
-            if (index >= items.length) {
-                return;
+            let text = "";
+            let failed = false;
+
+            try {
+                text = await fetchDatabaseFile(prefix);
+            } catch (error) {
+                console.error(error);
+                failed = true;
             }
 
-            output[index] = await lookupBarcode(items[index]);
+            if (text) {
 
-            completed++;
+                const rows = parseCSV(text);
 
-            const percent =
-                Math.round((completed / items.length) * 100);
+                for (let i = 1; i < rows.length; i++) {
+
+                    const ean = (rows[i][0] || "").trim();
+                    const originals = group.get(ean);
+
+                    if (originals) {
+
+                        const description = rows[i][1] || "";
+
+                        originals.forEach(original => {
+                            resultMap.set(original, makeResult(original, description, "Retail DB", description ? "FOUND" : "NOT FOUND"));
+                            if (description) found++;
+                        });
+
+                        group.delete(ean);
+                    }
+                }
+            }
+
+            // Whatever is left in this prefix was not found
+            group.forEach(originals => {
+                originals.forEach(original => {
+                    resultMap.set(original, makeResult(original, "", "Retail DB", failed ? "ERROR" : "NOT FOUND"));
+                });
+            });
+
+            groups.delete(prefix);
+
+            filesDone++;
+
+            const percent = Math.round((filesDone / prefixes.length) * 100);
 
             progressBar.style.width = percent + "%";
 
             progressText.textContent =
-                `${completed.toLocaleString()} / ${items.length.toLocaleString()} (${percent}%)`;
+                `Retail database: ${filesDone.toLocaleString()} / ${prefixes.length.toLocaleString()} files checked (${percent}%) | Found so far: ${found.toLocaleString()}`;
 
-            updateStats(output);
+            foundElement.textContent = found.toLocaleString();
         }
     }
 
     const workers = [];
 
-    for (let i = 0; i < Math.min(workerCount, items.length); i++) {
+    for (let i = 0; i < Math.min(DB_FETCH_WORKERS, prefixes.length); i++) {
         workers.push(worker());
     }
 
     await Promise.all(workers);
 
-    return output;
+    return resultMap;
+}
+
+
+async function lookupWithApi(barcodes, resultMap) {
+
+    for (let i = 0; i < barcodes.length; i++) {
+
+        const barcode = barcodes[i];
+        const result = await lookupBarcode(barcode);
+
+        if (result.status === "FOUND" || !resultMap.has(barcode)) {
+            resultMap.set(barcode, result);
+        }
+
+        const percent = Math.round(((i + 1) / barcodes.length) * 100);
+        const secondsLeft = Math.round(((barcodes.length - i - 1) * API_DELAY_MS) / 1000);
+
+        progressBar.style.width = percent + "%";
+
+        progressText.textContent =
+            `Open Food Facts: ${(i + 1).toLocaleString()} / ${barcodes.length.toLocaleString()} (${percent}%) | about ${secondsLeft}s left`;
+
+        if (i < barcodes.length - 1) {
+            await sleep(API_DELAY_MS);
+        }
+    }
 }
 
 
 function updateStats(data) {
 
-    const valid = data.filter(Boolean);
+    let found = 0;
 
-    const found = valid.filter(x => x.status === "FOUND").length;
-    const notFound = valid.filter(x => x.status !== "FOUND").length;
+    for (let i = 0; i < data.length; i++) {
+        if (data[i] && data[i].status === "FOUND") {
+            found++;
+        }
+    }
 
     foundElement.textContent = found.toLocaleString();
-    notFoundElement.textContent = notFound.toLocaleString();
+    notFoundElement.textContent = (data.length - found).toLocaleString();
 }
 
 
@@ -558,6 +762,8 @@ function setControlsDisabled(disabled) {
     csvFile.disabled = disabled;
     barcodeColumn.disabled = disabled;
     sheetSelect.disabled = disabled;
+    lookupSource.disabled = disabled;
+    apiFallback.disabled = disabled;
 }
 
 
@@ -574,44 +780,95 @@ startButton.addEventListener("click", async function () {
         return;
     }
 
+    const source = lookupSource.value;
+
+    if (source === "api" && uniqueBarcodes.length > API_MAX_BARCODES) {
+
+        progressText.textContent =
+            `Open Food Facts only allows small batches (max ${API_MAX_BARCODES.toLocaleString()} barcodes). You have ${uniqueBarcodes.length.toLocaleString()} - choose "My retail database" instead.`;
+
+        return;
+    }
+
     setControlsDisabled(true);
 
     downloadButton.disabled = true;
     resultsTable.innerHTML = "";
     progressBar.style.width = "0%";
-    progressText.textContent = "Starting online lookup...";
+    progressText.textContent = "Starting lookup...";
     foundElement.textContent = "0";
     notFoundElement.textContent = "0";
 
     try {
 
-        results = await processWithConcurrency(uniqueBarcodes, 5);
+        let resultMap;
 
-        results = results.filter(Boolean);
+        if (source === "api") {
+
+            resultMap = new Map();
+
+            await lookupWithApi(uniqueBarcodes, resultMap);
+
+        } else {
+
+            resultMap = await lookupInDatabase(uniqueBarcodes);
+
+            if (apiFallback.checked) {
+
+                const missing = uniqueBarcodes.filter(b => {
+                    const r = resultMap.get(b);
+                    return r && r.status === "NOT FOUND";
+                });
+
+                if (missing.length && missing.length <= API_MAX_BARCODES) {
+
+                    await lookupWithApi(missing, resultMap);
+
+                } else if (missing.length > API_MAX_BARCODES) {
+
+                    console.warn(`Skipped Open Food Facts check: ${missing.length} barcodes not found (limit ${API_MAX_BARCODES}).`);
+                }
+            }
+        }
+
+        results = uniqueBarcodes.map(b =>
+            resultMap.get(b) || makeResult(b, "", "", "NOT FOUND")
+        );
 
         updateStats(results);
 
         resultsTable.innerHTML = "";
 
-        results
-            .filter(x => x.status === "FOUND")
-            .slice(0, 100)
-            .forEach(result => {
+        let shown = 0;
 
-                const tr = document.createElement("tr");
+        for (const result of results) {
 
-                tr.innerHTML = `
-                    <td>${escapeHTML(result.barcode)}</td>
-                    <td>${escapeHTML(result.description)}</td>
-                    <td>${escapeHTML(result.source)}</td>
-                    <td>${escapeHTML(result.status)}</td>
-                `;
+            if (result.status !== "FOUND") {
+                continue;
+            }
 
-                resultsTable.appendChild(tr);
-            });
+            const tr = document.createElement("tr");
+
+            tr.innerHTML = `
+                <td>${escapeHTML(result.barcode)}</td>
+                <td>${escapeHTML(result.description)}</td>
+                <td>${escapeHTML(result.source)}</td>
+                <td>${escapeHTML(result.status)}</td>
+            `;
+
+            resultsTable.appendChild(tr);
+
+            if (++shown >= 100) {
+                break;
+            }
+        }
+
+        const foundCount = results.filter(r => r.status === "FOUND").length;
+
+        progressBar.style.width = "100%";
 
         progressText.textContent =
-            `Completed ${results.length.toLocaleString()} online lookups`;
+            `Completed: ${results.length.toLocaleString()} unique barcodes checked, ${foundCount.toLocaleString()} found`;
 
         downloadButton.disabled = false;
 
@@ -706,14 +963,10 @@ function createResultCSV() {
 // Build sheet with every value stored as TEXT so barcodes keep all digits
 function buildTextSheet(rows) {
 
-    const sheet = XLSX.utils.aoa_to_sheet(
-        rows.map(row => row.map(value =>
-            value === null || value === undefined ? "" : String(value)
-        ))
-    );
+    const sheet = XLSX.utils.aoa_to_sheet(rows, { dense: true });
 
     const columnCount = rows[0] ? rows[0].length : 0;
-    const sample = rows.slice(0, 500);
+    const sampleSize = Math.min(rows.length, 500);
 
     sheet["!cols"] = [];
 
@@ -721,9 +974,10 @@ function buildTextSheet(rows) {
 
         let longest = 8;
 
-        sample.forEach(row => {
-            longest = Math.max(longest, String(row[c] || "").length);
-        });
+        for (let r = 0; r < sampleSize; r++) {
+            const length = String(rows[r][c] || "").length;
+            if (length > longest) longest = length;
+        }
 
         sheet["!cols"].push({ wch: Math.min(longest + 2, 60) });
     }
@@ -748,15 +1002,18 @@ function createResultXLSX(fileName) {
         "Results"
     );
 
-    const summaryRows = [
-        ["Barcode", "Online Item Description", "Lookup Source", "Lookup Status"],
-        ...results.map(r => [r.barcode, r.description, r.source, r.status])
-    ];
+    const notFoundRows = [["Barcode", "Lookup Status"]];
+
+    results.forEach(r => {
+        if (r.status !== "FOUND") {
+            notFoundRows.push([r.barcode, r.status]);
+        }
+    });
 
     XLSX.utils.book_append_sheet(
         workbook,
-        buildTextSheet(summaryRows),
-        "Unique Barcodes"
+        buildTextSheet(notFoundRows),
+        "Not Found Barcodes"
     );
 
     XLSX.writeFile(workbook, fileName, { compression: true });
@@ -790,9 +1047,24 @@ downloadButton.addEventListener("click", function () {
 
     try {
 
-        if (outputFormat.value === "xlsx") {
+        if (outputFormat.value === "xlsx" && sourceRows.length + 1 > EXCEL_MAX_ROWS) {
 
-            createResultXLSX(baseName + ".xlsx");
+            progressText.textContent =
+                `Too many rows for Excel (limit ${EXCEL_MAX_ROWS.toLocaleString()}). Please choose CSV.`;
+
+        } else if (outputFormat.value === "xlsx") {
+
+            progressText.textContent = "Building Excel file (large files can take a minute)...";
+
+            setTimeout(() => {
+                try {
+                    createResultXLSX(baseName + ".xlsx");
+                    progressText.textContent = "Excel file downloaded";
+                } catch (error) {
+                    console.error(error);
+                    progressText.textContent = "Download failed: " + error.message;
+                }
+            }, 50);
 
         } else {
 

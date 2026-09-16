@@ -201,3 +201,17 @@ input:focus-visible {
     outline: 3px solid #1677ff;
     outline-offset: 2px;
 }
+
+.check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    font-size: 14px;
+    color: #444;
+}
+
+.check input {
+    width: auto;
+    padding: 0;
+}

@@ -48,6 +48,19 @@
 
         <h2>3. Online Lookup</h2>
 
+        <div class="field">
+            <label for="lookupSource">Look up descriptions in</label>
+            <select id="lookupSource">
+                <option value="db">My retail database on GitHub (fast, any file size)</option>
+                <option value="api">Open Food Facts API (max 300 barcodes)</option>
+            </select>
+        </div>
+
+        <label class="check">
+            <input type="checkbox" id="apiFallback">
+            Also check Open Food Facts for barcodes not found (only when 300 or fewer are left)
+        </label>
+
         <button id="startButton" disabled>
             START ONLINE LOOKUP
         </button>
